@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -13,17 +14,12 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/catalog"
 )
 
-// Store owns orders. Upstream reads (cart, catalog) arrive as validated
-// inputs; only the INSERTs run inside the transaction (02 clients) —
-// locks are held for milliseconds, never for network calls.
 type Store struct {
 	pool    *pgxpool.Pool
 	carts   CartReader
 	catalog CatalogLookup
 }
 
-// CartReader + CatalogLookup are narrow interfaces (not *Client structs) so
-// tests inject stubs without HTTP. Same seam rule as cart's Catalog interface.
 type CartReader interface {
 	GetCart(ctx context.Context, userID int64) (*cart.Cart, error)
 }
@@ -36,23 +32,14 @@ func NewStore(pool *pgxpool.Pool, carts CartReader, catalog CatalogLookup) *Stor
 	return &Store{pool: pool, carts: carts, catalog: catalog}
 }
 
-// Allowed maps current → permitted next states. Cancel is the only writer
-// in this slice; accept/prepare/ready arrive with Slice 5 as new rows,
-// never a new mechanism.
 var Allowed = map[string][]string{
 	"pending": {"cancelled"},
 }
 
 func allowed(from, next string) bool {
-	for _, n := range Allowed[from] {
-		if n == next {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(Allowed[from], next)
 }
 
-// Create validates, then inserts order + lines atomically.
 func (s *Store) Create(ctx context.Context, userID int64, key string) (*Order, error) {
 	cart, err := s.carts.GetCart(ctx, userID)
 	if err != nil {
@@ -119,14 +106,11 @@ func (s *Store) Create(ctx context.Context, userID int64, key string) (*Order, e
 	return s.Get(ctx, userID, orderID)
 }
 
-// isDuplicateKey detects the UNIQUE (user_id, idempotency_key) violation.
 func isDuplicateKey(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-// replayOrConflict runs on duplicate key: same cart → original (replay,
-// 201 same body); changed cart → 409 (not a new order, not the stale one).
 func (s *Store) replayOrConflict(ctx context.Context, userID int64, key string, cart *cart.Cart) (*Order, error) {
 	original, err := s.getByKey(ctx, userID, key)
 	if err != nil {
@@ -138,8 +122,6 @@ func (s *Store) replayOrConflict(ctx context.Context, userID int64, key string, 
 	return nil, ErrKeyConflict
 }
 
-// Transition validates and applies one move atomically (read status, check
-// map, update — concurrent cancels collapse on the row, not in Go).
 func (s *Store) Transition(ctx context.Context, orderID, userID int64, next string) (*Order, error) {
 	var current string
 	err := s.pool.QueryRow(ctx,
@@ -162,7 +144,6 @@ func (s *Store) Transition(ctx context.Context, orderID, userID int64, next stri
 	return s.Get(ctx, userID, orderID)
 }
 
-// Get reads one order with its lines (owner-scoped, same rule as Transition).
 func (s *Store) Get(ctx context.Context, userID, orderID int64) (*Order, error) {
 	var o Order
 	err := s.pool.QueryRow(ctx,
@@ -194,8 +175,6 @@ func (s *Store) Get(ctx context.Context, userID, orderID int64) (*Order, error) 
 	return &o, rows.Err()
 }
 
-// getByKey loads the order for a (user, key) pair. Used ONLY on the duplicate
-// path — the hot path never pays for it.
 func (s *Store) getByKey(ctx context.Context, userID int64, key string) (*Order, error) {
 	var id int64
 	err := s.pool.QueryRow(ctx,
@@ -207,7 +186,6 @@ func (s *Store) getByKey(ctx context.Context, userID int64, key string) (*Order,
 	return s.Get(ctx, userID, id)
 }
 
-// sameCart decides replay vs conflict: identical lines ⇒ same order.
 func sameCart(o *Order, c *cart.Cart) bool {
 	if o.BranchID != c.BranchID || len(o.Items) != len(c.Items) {
 		return false

@@ -9,7 +9,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Handlers holds the store. Constructed once in main, methods are the routes.
 type Handlers struct {
 	store *Store
 	pool  *pgxpool.Pool
@@ -19,8 +18,6 @@ func NewHandlers(store *Store, pool *pgxpool.Pool) *Handlers {
 	return &Handlers{store: store, pool: pool}
 }
 
-// ownerID reads the gateway-verified owner (same rule as cart: never a body
-// field — a client-supplied user_id would let anyone order as anyone).
 func ownerID(r *http.Request) (int64, error) {
 	id, err := strconv.ParseInt(r.Header.Get("X-User-Id"), 10, 64)
 	if err != nil || id <= 0 {
@@ -29,8 +26,6 @@ func ownerID(r *http.Request) (int64, error) {
 	return id, nil
 }
 
-// respond is the ONLY success writer; fail maps store errors to contract
-// codes (unmapped errors are 500 with a fixed message — details go to logs).
 func respond(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -54,8 +49,6 @@ func fail(w http.ResponseWriter, err error) {
 	}
 }
 
-// Create checks out the cart. Always returns the full order — mobile clears
-// its own cart after 201 (documented split, 00-contract).
 func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 	owner, err := ownerID(r)
 	if err != nil {
@@ -77,7 +70,6 @@ func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 	respond(w, 201, map[string]any{"order": order})
 }
 
-// Get reads one order (owner-scoped).
 func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) {
 	owner, err := ownerID(r)
 	if err != nil {
@@ -97,7 +89,6 @@ func (h *Handlers) Get(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"order": order})
 }
 
-// Cancel moves pending → cancelled via the transition table (nothing else).
 func (h *Handlers) Cancel(w http.ResponseWriter, r *http.Request) {
 	owner, err := ownerID(r)
 	if err != nil {
@@ -117,7 +108,6 @@ func (h *Handlers) Cancel(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"order": order})
 }
 
-// Health never touches the database; Ready pings order_db only.
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]string{"status": "ok"})
 }
