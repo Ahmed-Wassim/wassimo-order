@@ -32,4 +32,7 @@ build:
 vet:
 	go vet ./...
 
-.PHONY: migrate rollback status migration-create build vet
+.PHONY: migrate rollback status migration-create build vet drill-currency
+
+drill-currency:
+	bash scripts/currency-drills.sh
