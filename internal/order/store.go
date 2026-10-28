@@ -12,12 +12,21 @@ import (
 
 	"github.com/ahmed-wassim/wassimo-order/internal/cart"
 	"github.com/ahmed-wassim/wassimo-order/internal/catalog"
+	"github.com/ahmed-wassim/wassimo-order/internal/currency"
 )
 
 type Store struct {
 	pool    *pgxpool.Pool
 	carts   CartReader
 	catalog CatalogLookup
+
+	rates            RateSource
+	baseCurrency     string
+	chargeCurrencies []string
+}
+
+type RateSource interface {
+	Latest(ctx context.Context, quote string) (currency.Rate, error)
 }
 
 type CartReader interface {
@@ -28,8 +37,10 @@ type CatalogLookup interface {
 	Lookup(ctx context.Context, ids []int64) (map[int64]catalog.Item, error)
 }
 
-func NewStore(pool *pgxpool.Pool, carts CartReader, catalog CatalogLookup) *Store {
-	return &Store{pool: pool, carts: carts, catalog: catalog}
+func NewStore(pool *pgxpool.Pool, carts CartReader, catalog CatalogLookup,
+	rates RateSource, baseCurrency string, chargeCurrencies []string) *Store {
+	return &Store{pool: pool, carts: carts, catalog: catalog,
+		rates: rates, baseCurrency: baseCurrency, chargeCurrencies: chargeCurrencies}
 }
 
 var Allowed = map[string][]string{

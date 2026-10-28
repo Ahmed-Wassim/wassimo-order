@@ -13,6 +13,8 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@order-db:5432/${POSTGRES_DB}?sslmode=disable
       - CART_SERVICE_URL=http://cart:8080
       - CATALOG_SERVICE_URL=http://catalog:8080
+      - RATE_PRIMARY_URL=${RATE_PRIMARY_URL}
+      - RATE_FALLBACK_URL=${RATE_FALLBACK_URL}
     depends_on: { order-db: { condition: service_healthy } }
     networks: [wassimo-network]
 
@@ -26,6 +28,8 @@ services:
       - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@order-db:5432/${POSTGRES_DB}?sslmode=disable
       - CART_SERVICE_URL=http://cart:8080
       - CATALOG_SERVICE_URL=http://catalog:8080
+      - RATE_PRIMARY_URL=${RATE_PRIMARY_URL}
+      - RATE_FALLBACK_URL=${RATE_FALLBACK_URL}
     depends_on: { order-db: { condition: service_healthy } }
     networks: [wassimo-network]
 

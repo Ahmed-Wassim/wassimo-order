@@ -11,6 +11,7 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/cart"
 	"github.com/ahmed-wassim/wassimo-order/internal/catalog"
 	"github.com/ahmed-wassim/wassimo-order/internal/config"
+	"github.com/ahmed-wassim/wassimo-order/internal/currency"
 	"github.com/ahmed-wassim/wassimo-order/internal/order"
 )
 
@@ -27,7 +28,26 @@ func main() {
 	}
 	defer pool.Close()
 
-	store := order.NewStore(pool, cart.New(cfg.CartURL), catalog.New(cfg.CatalogURL))
+	sources := []currency.Source{
+		{Name: cfg.RateSource, URL: cfg.RateURL},
+	}
+	if cfg.FallbackURL != "" {
+		sources = append(sources, currency.Source{
+			Name: cfg.FallbackSource, URL: cfg.FallbackURL,
+		})
+	}
+	if len(sources) == 0 {
+		log.Fatalf("config: at least one rate source is required")
+	}
+	for _, s := range sources {
+		if !currency.KnownSource(s.Name) {
+			log.Fatalf("config: unknown rate source adapter %q", s.Name)
+		}
+	}
+	rateClient := currency.New(cfg.BaseCurrency, cfg.QuoteCurrencies, sources, cfg.RateTimeout)
+
+	store := order.NewStore(pool, cart.New(cfg.CartURL), catalog.New(cfg.CatalogURL),
+		rateClient, cfg.BaseCurrency, cfg.ChargeCurrencies)
 	h := order.NewHandlers(store, pool)
 
 	r := http.NewServeMux()
@@ -36,6 +56,7 @@ func main() {
 	r.Handle("/orders", h.Routes())
 	r.Handle("/orders/", h.Routes())
 
-	log.Printf("order listening on :%s cart=%s catalog=%s", cfg.Port, cfg.CartURL, cfg.CatalogURL)
+	log.Printf("order listening on :%s cart=%s catalog=%s sources=%v (base=%s)",
+		cfg.Port, cfg.CartURL, cfg.CatalogURL, sources, cfg.BaseCurrency)
 	log.Fatal(http.ListenAndServe(":"+cfg.Port, r))
 }
