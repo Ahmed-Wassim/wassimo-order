@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -112,6 +114,41 @@ func (h *Handlers) Cancel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respond(w, 200, map[string]any{"order": order})
+}
+
+func (h *Handlers) Rates(w http.ResponseWriter, r *http.Request) {
+	rates, broken := h.store.rates.QuoteAll(r.Context())
+	if len(rates) == 0 {
+		respond(w, 503, map[string]any{"error": "rate unavailable"})
+		return
+	}
+
+	type pair struct {
+		Quote     string `json:"quote"`
+		Pair      string `json:"pair"`
+		Value     string `json:"value"`
+		Source    string `json:"source"`
+		FetchedAt string `json:"fetched_at"`
+	}
+	out := make([]pair, 0, len(rates))
+	for _, rt := range rates {
+		out = append(out, pair{
+			Quote:     strings.TrimPrefix(rt.Pair, h.store.base+"/"),
+			Pair:      rt.Pair,
+			Value:     rt.Value,
+			Source:    rt.Source,
+			FetchedAt: rt.FetchedAt.UTC().Format(time.RFC3339),
+		})
+	}
+
+	payload := map[string]any{
+		"base":  h.store.base,
+		"rates": out,
+	}
+	if len(broken) > 0 {
+		payload["broken"] = broken
+	}
+	respond(w, 200, payload)
 }
 
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {

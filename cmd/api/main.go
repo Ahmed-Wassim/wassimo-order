@@ -53,6 +53,7 @@ func main() {
 	r := http.NewServeMux()
 	r.HandleFunc("/health", h.Health)
 	r.HandleFunc("/ready", h.Ready)
+	r.HandleFunc("/rates", h.Rates)
 	r.Handle("/orders", h.Routes())
 	r.Handle("/orders/", h.Routes())
 
