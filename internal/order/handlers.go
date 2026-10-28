@@ -34,8 +34,13 @@ func respond(w http.ResponseWriter, status int, payload any) {
 
 func fail(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, ErrEmptyCart), errors.Is(err, ErrPriceMoved), errors.Is(err, ErrDeadItem), errors.Is(err, ErrBranchChanged):
+	case errors.Is(err, ErrEmptyCart), errors.Is(err, ErrPriceMoved),
+		errors.Is(err, ErrDeadItem), errors.Is(err, ErrBranchChanged):
 		respond(w, 422, map[string]string{"error": err.Error()})
+	case errors.Is(err, ErrBadCurrency):
+		respond(w, 422, map[string]string{"error": "unsupported currency"})
+	case errors.Is(err, ErrRateUnavailable):
+		respond(w, 503, map[string]string{"error": "rate unavailable"})
 	case errors.Is(err, ErrNoOrder):
 		respond(w, 404, map[string]string{"error": "order not found"})
 	case errors.Is(err, ErrBadMove):
@@ -56,13 +61,14 @@ func (h *Handlers) Create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Key string `json:"idempotency_key"`
+		Key      string `json:"idempotency_key"`
+		Currency string `json:"currency"`
 	}
 	if json.NewDecoder(r.Body).Decode(&in) != nil || in.Key == "" {
 		respond(w, 400, map[string]string{"error": "idempotency_key required"})
 		return
 	}
-	order, err := h.store.Create(r.Context(), owner, in.Key)
+	order, err := h.store.Create(r.Context(), owner, in.Key, in.Currency)
 	if err != nil {
 		fail(w, err)
 		return

@@ -2,9 +2,11 @@ package order
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -15,18 +17,16 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/currency"
 )
 
+// Store — rates is the step 02+03 client (ordered sources); allowed is
+// CHARGE_CURRENCIES, the fast door-check list.
 type Store struct {
 	pool    *pgxpool.Pool
 	carts   CartReader
 	catalog CatalogLookup
 
-	rates            RateSource
-	baseCurrency     string
-	chargeCurrencies []string
-}
-
-type RateSource interface {
-	Latest(ctx context.Context, quote string) (currency.Rate, error)
+	rates   *currency.Client
+	base    string
+	allowed map[string]bool
 }
 
 type CartReader interface {
@@ -38,9 +38,13 @@ type CatalogLookup interface {
 }
 
 func NewStore(pool *pgxpool.Pool, carts CartReader, catalog CatalogLookup,
-	rates RateSource, baseCurrency string, chargeCurrencies []string) *Store {
+	rateClient *currency.Client, base string, allowed []string) *Store {
+	m := make(map[string]bool, len(allowed))
+	for _, c := range allowed {
+		m[c] = true
+	}
 	return &Store{pool: pool, carts: carts, catalog: catalog,
-		rates: rates, baseCurrency: baseCurrency, chargeCurrencies: chargeCurrencies}
+		rates: rateClient, base: base, allowed: m}
 }
 
 var Allowed = map[string][]string{
@@ -51,7 +55,23 @@ func allowed(from, next string) bool {
 	return slices.Contains(Allowed[from], next)
 }
 
-func (s *Store) Create(ctx context.Context, userID int64, key string) (*Order, error) {
+func normalizeCharge(in string, base string, allowed map[string]bool) (string, error) {
+	c := strings.ToUpper(strings.TrimSpace(in))
+	if c == "" {
+		return base, nil
+	}
+	if !allowed[c] {
+		return "", ErrBadCurrency
+	}
+	return c, nil
+}
+
+func (s *Store) Create(ctx context.Context, userID int64, key, chargeIn string) (*Order, error) {
+	charge, err := normalizeCharge(chargeIn, s.base, s.allowed)
+	if err != nil {
+		return nil, err
+	}
+
 	cart, err := s.carts.GetCart(ctx, userID)
 	if err != nil {
 		return nil, ErrStoreDown
@@ -79,6 +99,10 @@ func (s *Store) Create(ctx context.Context, userID int64, key string) (*Order, e
 			return nil, ErrBranchChanged
 		}
 	}
+	base := cart.Items[0].Currency
+	if base != s.base {
+		return nil, ErrRateUnavailable
+	}
 
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -90,14 +114,44 @@ func (s *Store) Create(ctx context.Context, userID int64, key string) (*Order, e
 	for _, l := range cart.Items {
 		total += int64(l.PriceCents) * int64(l.Qty)
 	}
+
+	// All five snapshot values are decided BEFORE the insert; the row is
+	// born complete or not at all.
+	var chargeCurrency any = nil
+	var chargeAmountCents any = nil
+	var rateUsed any = nil
+	var rateSource any = nil
+	var fetchedAt any = nil
+	if charge != base {
+		rate, err := s.rates.Latest(ctx, charge)
+		if err != nil {
+			return nil, ErrRateUnavailable
+		}
+		cents, err := currency.Convert(total, rate)
+		if err != nil {
+			return nil, ErrRateUnavailable
+		}
+		if cents <= 0 {
+			return nil, ErrRateUnavailable
+		}
+		chargeCurrency = charge
+		chargeAmountCents = cents
+		rateUsed = rate.Value
+		rateSource = rate.Source
+		fetchedAt = rate.FetchedAt
+	}
+
 	err = tx.QueryRow(ctx,
-		`INSERT INTO orders (user_id, branch_id, status, total_cents, currency, idempotency_key)
-		 VALUES ($1,$2,'pending',$3,$4,$5) RETURNING id`,
-		userID, cart.BranchID, total, cart.Items[0].Currency, key,
+		`INSERT INTO orders (user_id, branch_id, status, total_cents, currency,
+		                     idempotency_key, charge_currency, charge_amount_cents,
+		                     exchange_rate_used, exchange_rate_source, exchange_rate_fetched_at)
+		 VALUES ($1,$2,'pending',$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+		userID, cart.BranchID, total, base, key,
+		chargeCurrency, chargeAmountCents, rateUsed, rateSource, fetchedAt,
 	).Scan(&orderID)
 	if err != nil {
 		if isDuplicateKey(err) {
-			return s.replayOrConflict(ctx, userID, key, cart)
+			return s.replayOrConflict(ctx, userID, key, cart, charge)
 		}
 		return nil, fmt.Errorf("insert order: %w", err)
 	}
@@ -122,12 +176,12 @@ func isDuplicateKey(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
 
-func (s *Store) replayOrConflict(ctx context.Context, userID int64, key string, cart *cart.Cart) (*Order, error) {
+func (s *Store) replayOrConflict(ctx context.Context, userID int64, key string, cart_ *cart.Cart, charge string) (*Order, error) {
 	original, err := s.getByKey(ctx, userID, key)
 	if err != nil {
 		return nil, err
 	}
-	if sameCart(original, cart) {
+	if sameCart(original, cart_) && original.chargedCurrency() == charge {
 		return original, nil
 	}
 	return nil, ErrKeyConflict
@@ -155,18 +209,37 @@ func (s *Store) Transition(ctx context.Context, orderID, userID int64, next stri
 	return s.Get(ctx, userID, orderID)
 }
 
+func scanSnapshot(o *Order, chargeCurrency sql.NullString, cents sql.NullInt64,
+	rate sql.NullString, source sql.NullString, fetched sql.NullTime) {
+	if chargeCurrency.Valid {
+		o.ChargeCurrency = &chargeCurrency.String
+		o.ChargeAmountCents = &cents.Int64
+		o.ExchangeRateUsed = &rate.String
+		o.ExchangeRateSource = &source.String
+		o.ExchangeRateFetchedAt = &fetched.Time
+	}
+}
+
 func (s *Store) Get(ctx context.Context, userID, orderID int64) (*Order, error) {
 	var o Order
+	var chargeCurrency sql.NullString
+	var cents sql.NullInt64
+	var rate, source sql.NullString
+	var fetched sql.NullTime
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, user_id, branch_id, status, total_cents, currency
+		`SELECT id, user_id, branch_id, status, total_cents, currency,
+		        charge_currency, charge_amount_cents, exchange_rate_used, exchange_rate_source, exchange_rate_fetched_at
 		 FROM orders WHERE id=$1 AND user_id=$2`, orderID, userID,
-	).Scan(&o.ID, &o.UserID, &o.BranchID, &o.Status, &o.Total, &o.Currency)
+	).Scan(&o.ID, &o.UserID, &o.BranchID, &o.Status, &o.Total, &o.Currency,
+		&chargeCurrency, &cents, &rate, &source, &fetched)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNoOrder
 		}
 		return nil, fmt.Errorf("get order: %w", err)
 	}
+	scanSnapshot(&o, chargeCurrency, cents, rate, source, fetched)
+
 	rows, err := s.pool.Query(ctx,
 		`SELECT catalog_item_id, name, price_cents, currency, qty
 		 FROM order_items WHERE order_id=$1 ORDER BY id`, orderID,
