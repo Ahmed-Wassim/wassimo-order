@@ -26,6 +26,9 @@ type Order struct {
 	ExchangeRateUsed      *string    `json:"exchange_rate_used,omitempty"`
 	ExchangeRateSource    *string    `json:"exchange_rate_source,omitempty"`
 	ExchangeRateFetchedAt *time.Time `json:"exchange_rate_fetched_at,omitempty"`
+
+	PaidAt    *time.Time `json:"paid_at,omitempty"`
+	PaymentID *string    `json:"payment_id,omitempty"`
 }
 
 func (o *Order) chargedCurrency() string {

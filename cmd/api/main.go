@@ -4,6 +4,9 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -12,6 +15,7 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/catalog"
 	"github.com/ahmed-wassim/wassimo-order/internal/config"
 	"github.com/ahmed-wassim/wassimo-order/internal/currency"
+	"github.com/ahmed-wassim/wassimo-order/internal/events"
 	"github.com/ahmed-wassim/wassimo-order/internal/order"
 )
 
@@ -57,7 +61,24 @@ func main() {
 	r.Handle("/orders", h.Routes())
 	r.Handle("/orders/", h.Routes())
 
-	log.Printf("order listening on :%s cart=%s catalog=%s sources=%v (base=%s)",
-		cfg.Port, cfg.CartURL, cfg.CatalogURL, sources, cfg.BaseCurrency)
-	log.Fatal(http.ListenAndServe(":"+cfg.Port, r))
+	appCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if cfg.RabbitURL != "" {
+		go events.Run(appCtx, cfg.RabbitURL, store.ConsumePaymentEvent)
+	}
+
+	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
+	go func() {
+		log.Printf("order listening on :%s cart=%s catalog=%s sources=%v (base=%s) broker=%v",
+			cfg.Port, cfg.CartURL, cfg.CatalogURL, sources, cfg.BaseCurrency, cfg.RabbitURL != "")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	<-appCtx.Done()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	_ = srv.Shutdown(shutdownCtx)
 }

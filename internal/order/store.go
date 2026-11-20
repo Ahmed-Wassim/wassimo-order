@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -15,6 +17,7 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/cart"
 	"github.com/ahmed-wassim/wassimo-order/internal/catalog"
 	"github.com/ahmed-wassim/wassimo-order/internal/currency"
+	"github.com/ahmed-wassim/wassimo-order/internal/events"
 )
 
 // Store — rates is the step 02+03 client (ordered sources); allowed is
@@ -225,13 +228,15 @@ func (s *Store) Get(ctx context.Context, userID, orderID int64) (*Order, error) 
 	var chargeCurrency sql.NullString
 	var cents sql.NullInt64
 	var rate, source sql.NullString
-	var fetched sql.NullTime
+	var fetched, paidAt sql.NullTime
+	var paymentID sql.NullString
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, user_id, branch_id, status, total_cents, currency,
-		        charge_currency, charge_amount_cents, exchange_rate_used, exchange_rate_source, exchange_rate_fetched_at
+		        charge_currency, charge_amount_cents, exchange_rate_used, exchange_rate_source, exchange_rate_fetched_at,
+		        paid_at, payment_id
 		 FROM orders WHERE id=$1 AND user_id=$2`, orderID, userID,
 	).Scan(&o.ID, &o.UserID, &o.BranchID, &o.Status, &o.Total, &o.Currency,
-		&chargeCurrency, &cents, &rate, &source, &fetched)
+		&chargeCurrency, &cents, &rate, &source, &fetched, &paidAt, &paymentID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNoOrder
@@ -239,6 +244,12 @@ func (s *Store) Get(ctx context.Context, userID, orderID int64) (*Order, error) 
 		return nil, fmt.Errorf("get order: %w", err)
 	}
 	scanSnapshot(&o, chargeCurrency, cents, rate, source, fetched)
+	if paidAt.Valid {
+		o.PaidAt = &paidAt.Time
+	}
+	if paymentID.Valid {
+		o.PaymentID = &paymentID.String
+	}
 
 	rows, err := s.pool.Query(ctx,
 		`SELECT catalog_item_id, name, price_cents, currency, qty
@@ -285,4 +296,114 @@ func sameCart(o *Order, c *cart.Cart) bool {
 		}
 	}
 	return true
+}
+
+func (s *Store) ConsumePaymentEvent(ctx context.Context, env events.Envelope) error {
+	switch env.EventType {
+	case events.EventPaymentSucceeded:
+		return s.consumePaymentSucceeded(ctx, env)
+	case events.EventPaymentFailed:
+		return s.consumePaymentFailed(ctx, env)
+	default:
+		return nil
+	}
+}
+
+func (s *Store) consumePaymentSucceeded(ctx context.Context, env events.Envelope) error {
+	orderID, err := parseOrderReference(env.Payload.Reference)
+	if err != nil {
+		log.Printf("events: event %s dropped: %v", env.EventID, err)
+		return nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ErrStoreDown
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+		env.EventID)
+	if err != nil {
+		return ErrStoreDown
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+
+	var total int64
+	var currency, status string
+	err = tx.QueryRow(ctx,
+		`SELECT total_cents, currency, status FROM orders WHERE id=$1`,
+		orderID,
+	).Scan(&total, &currency, &status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		log.Printf("events: event %s: order %d not found — dropped", env.EventID, orderID)
+		return nil
+	}
+	if err != nil {
+		return ErrStoreDown
+	}
+
+	if env.Payload.AmountMinor != total || env.Payload.Currency != currency {
+		log.Printf("events: MISMATCH event %s: order %d says %d %s, event says %d %s",
+			env.EventID, orderID, total, currency, env.Payload.AmountMinor, env.Payload.Currency)
+	}
+
+	tag, err = tx.Exec(ctx,
+		`UPDATE orders
+		 SET status='paid', paid_at=NOW(), payment_id=$1, updated_at=NOW()
+		 WHERE id=$2 AND status='pending'`,
+		env.Payload.PaymentID, orderID)
+	if err != nil {
+		return ErrStoreDown
+	}
+	if tag.RowsAffected() == 0 {
+		log.Printf("events: event %s: order %d status '%s' refuses 'paid' — recorded, not applied",
+			env.EventID, orderID, status)
+	}
+
+	return tx.Commit(ctx)
+}
+
+func (s *Store) consumePaymentFailed(ctx context.Context, env events.Envelope) error {
+	orderID, err := parseOrderReference(env.Payload.Reference)
+	if err != nil {
+		log.Printf("events: event %s dropped: %v", env.EventID, err)
+		return nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ErrStoreDown
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO processed_events (event_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+		env.EventID)
+	if err != nil {
+		return ErrStoreDown
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
+	}
+
+	log.Printf("events: payment.failed event %s for order %d reason=%q",
+		env.EventID, orderID, env.Payload.ReasonCode)
+
+	return tx.Commit(ctx)
+}
+
+func parseOrderReference(reference string) (int64, error) {
+	const prefix = "order:"
+	if !strings.HasPrefix(reference, prefix) {
+		return 0, fmt.Errorf("unrelated reference %q", reference)
+	}
+	id, err := strconv.ParseInt(strings.TrimPrefix(reference, prefix), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("malformed reference %q", reference)
+	}
+	return id, nil
 }
