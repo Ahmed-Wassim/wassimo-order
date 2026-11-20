@@ -16,6 +16,8 @@ services:
       - RATE_PRIMARY_URL=${RATE_PRIMARY_URL}
       - RATE_FALLBACK_URL=${RATE_FALLBACK_URL}
       - RABBITMQ_URL=amqp://wassimo:wassimo-dev-password@rabbitmq:5672
+      - PAYMENT_SERVICE_URL=http://payment:8080
+      - PAYMENT_API_KEY=${PAYMENT_API_KEY}
     depends_on: { order-db: { condition: service_healthy } }
     networks: [wassimo-network]
 
@@ -32,6 +34,8 @@ services:
       - RATE_PRIMARY_URL=${RATE_PRIMARY_URL}
       - RATE_FALLBACK_URL=${RATE_FALLBACK_URL}
       - RABBITMQ_URL=amqp://wassimo:wassimo-dev-password@rabbitmq:5672
+      - PAYMENT_SERVICE_URL=http://payment:8080
+      - PAYMENT_API_KEY=${PAYMENT_API_KEY}
     depends_on: { order-db: { condition: service_healthy } }
     networks: [wassimo-network]
 

@@ -17,6 +17,7 @@ import (
 	"github.com/ahmed-wassim/wassimo-order/internal/currency"
 	"github.com/ahmed-wassim/wassimo-order/internal/events"
 	"github.com/ahmed-wassim/wassimo-order/internal/order"
+	"github.com/ahmed-wassim/wassimo-order/internal/payment"
 )
 
 func main() {
@@ -58,6 +59,20 @@ func main() {
 	r.HandleFunc("/health", h.Health)
 	r.HandleFunc("/ready", h.Ready)
 	r.HandleFunc("/rates", h.Rates)
+
+	payEnabled := false
+	if cfg.PaymentURL != "" && cfg.PaymentAPIKey != "" {
+		payClient := payment.NewClient(cfg.PaymentURL, cfg.PaymentAPIKey)
+		payHandlers := payment.NewHandlers(payClient, store)
+		r.HandleFunc("GET /pay-options", payHandlers.Options)
+		r.HandleFunc("POST /orders/{id}/pay", payHandlers.Pay)
+		r.HandleFunc("GET /orders/{id}/payment", payHandlers.Status)
+		r.HandleFunc("POST /orders/{id}/payment/resolve", payHandlers.Resolve)
+		r.HandleFunc("POST /orders/{id}/refunds", payHandlers.Refund)
+		r.HandleFunc("POST /orders/{id}/refunds/{rid}/resolve", payHandlers.ResolveRefund)
+		payEnabled = true
+	}
+
 	r.Handle("/orders", h.Routes())
 	r.Handle("/orders/", h.Routes())
 
@@ -70,8 +85,8 @@ func main() {
 
 	srv := &http.Server{Addr: ":" + cfg.Port, Handler: r}
 	go func() {
-		log.Printf("order listening on :%s cart=%s catalog=%s sources=%v (base=%s) broker=%v",
-			cfg.Port, cfg.CartURL, cfg.CatalogURL, sources, cfg.BaseCurrency, cfg.RabbitURL != "")
+		log.Printf("order listening on :%s cart=%s catalog=%s sources=%v (base=%s) broker=%v pay=%v",
+			cfg.Port, cfg.CartURL, cfg.CatalogURL, sources, cfg.BaseCurrency, cfg.RabbitURL != "", payEnabled)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal(err)
 		}

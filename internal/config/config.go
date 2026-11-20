@@ -28,6 +28,9 @@ type Config struct {
 	FallbackSource string
 
 	RabbitURL string
+
+	PaymentURL    string
+	PaymentAPIKey string
 }
 
 func Load() (Config, error) {
@@ -52,6 +55,9 @@ func Load() (Config, error) {
 		FallbackSource:   getEnv("RATE_FALLBACK_SOURCE", "er-api"),
 
 		RabbitURL: os.Getenv("RABBITMQ_URL"),
+
+		PaymentURL:    os.Getenv("PAYMENT_SERVICE_URL"),
+		PaymentAPIKey: os.Getenv("PAYMENT_API_KEY"),
 	}
 	if len(cfg.ChargeCurrencies) == 0 {
 		cfg.ChargeCurrencies = uniqueUpper(
