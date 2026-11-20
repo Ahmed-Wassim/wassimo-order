@@ -41,36 +41,25 @@ func respond(w http.ResponseWriter, status int, payload any) {
 }
 
 func (h *Handlers) fail(w http.ResponseWriter, err error) {
-	var upstream *UpstreamError
+	var se *StatusError
 	switch {
 	case errors.Is(err, order.ErrNoOrder):
 		respond(w, 404, map[string]string{"error": "order not found"})
-	case errors.Is(err, order.ErrStoreDown):
+	case errors.Is(err, order.ErrStoreDown), errors.Is(err, ErrUnavailable):
 		respond(w, 503, map[string]string{"error": "dependency unavailable"})
 	case errors.Is(err, order.ErrPaymentPointerConflict):
 		respond(w, 409, map[string]string{"error": "payment pointer conflict"})
-	case errors.Is(err, ErrUnavailable):
-		respond(w, 503, map[string]string{"error": "payment service unavailable"})
-	case errors.Is(err, ErrUnauthorized):
-		log.Printf("payment: upstream unauthorized: %v", err)
-		respond(w, 503, map[string]string{"error": "payment service unavailable"})
-	case errors.Is(err, ErrUpstream):
-		respond(w, 502, map[string]string{"error": "payment service error"})
-	case errors.As(err, &upstream):
-		status := upstream.Status
-		if status == 401 || status == 403 {
-			log.Printf("payment: upstream auth/status %d: %s", status, upstream.Body)
-			respond(w, 503, map[string]string{"error": "payment service unavailable"})
+	case errors.As(err, &se):
+		if se.Status == 401 || se.Status == 403 {
+			log.Printf("payment: upstream auth %d", se.Status)
+			respond(w, 503, map[string]string{"error": "dependency unavailable"})
 			return
 		}
-		if status < 400 {
-			status = 502
-		}
-		msg := upstream.Code
+		msg := se.Code
 		if msg == "" {
-			msg = "payment request rejected"
+			msg = "payment request failed"
 		}
-		respond(w, status, map[string]string{"error": msg})
+		respond(w, se.Status, map[string]string{"error": msg})
 	default:
 		respond(w, 500, map[string]string{"error": "internal"})
 	}
@@ -84,13 +73,11 @@ func payableAmountCurrency(o *order.Order) (int64, string) {
 }
 
 func (h *Handlers) Options(w http.ResponseWriter, r *http.Request) {
-	_, err := ownerID(r)
-	if err != nil {
+	if _, err := ownerID(r); err != nil {
 		respond(w, 401, map[string]string{"error": "unauthenticated"})
 		return
 	}
-	currency := r.URL.Query().Get("currency")
-	opts, err := h.client.Options(r.Context(), currency)
+	opts, err := h.client.Options(r.Context(), r.URL.Query().Get("currency"))
 	if err != nil {
 		h.fail(w, err)
 		return
@@ -117,11 +104,7 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var in payRequest
-	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
-		respond(w, 400, map[string]string{"error": "invalid body"})
-		return
-	}
-	if in.ProviderAccountID == "" || in.Method == "" {
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.ProviderAccountID == "" || in.Method == "" {
 		respond(w, 400, map[string]string{"error": "provider_account_id and method required"})
 		return
 	}
@@ -135,9 +118,18 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
-
 	if o.PaymentID != nil && *o.PaymentID != "" {
-		h.replayAnswer(w, r, orderID, *o.PaymentID, payableCurrency(o))
+		pay, err := h.client.GetPayment(r.Context(), *o.PaymentID)
+		if err != nil {
+			h.fail(w, err)
+			return
+		}
+		respond(w, 200, map[string]any{
+			"order_id":       orderID,
+			"payment_id":     *o.PaymentID,
+			"redirect_url":   nil,
+			"payment_status": pay.Status,
+		})
 		return
 	}
 	if o.Status != "pending" {
@@ -146,8 +138,7 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	amount, currency := payableAmountCurrency(o)
-	idemKey := fmt.Sprintf("order-pay-%d", orderID)
-	created, err := h.client.CreatePayment(r.Context(), idemKey, CreatePaymentRequest{
+	created, err := h.client.CreatePayment(r.Context(), fmt.Sprintf("order-pay-%d", orderID), CreatePaymentRequest{
 		Reference:         fmt.Sprintf("order:%d", orderID),
 		AmountMinor:       amount,
 		Currency:          currency,
@@ -165,43 +156,13 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 	charge, err := h.client.Charge(r.Context(), created.ID)
 	if err != nil {
-		// payment exists and pointer set; return created payment with charge error context
-		respond(w, 502, map[string]any{
-			"order_id":   orderID,
-			"payment_id": created.ID,
-			"error":      "charge failed",
-		})
+		respond(w, 502, map[string]any{"order_id": orderID, "payment_id": created.ID, "error": "charge failed"})
 		return
 	}
-	opts, _ := h.client.Options(r.Context(), currency)
 	respond(w, 201, map[string]any{
 		"order_id":     orderID,
 		"payment_id":   created.ID,
 		"redirect_url": charge.RedirectURL,
-		"options":      opts.Options,
-	})
-}
-
-func payableCurrency(o *order.Order) string {
-	if o.ChargeCurrency != nil && *o.ChargeCurrency != "" {
-		return *o.ChargeCurrency
-	}
-	return o.Currency
-}
-
-func (h *Handlers) replayAnswer(w http.ResponseWriter, r *http.Request, orderID int64, paymentID string, currency string) {
-	pay, err := h.client.GetPayment(r.Context(), paymentID)
-	if err != nil {
-		h.fail(w, err)
-		return
-	}
-	opts, _ := h.client.Options(r.Context(), currency)
-	respond(w, 200, map[string]any{
-		"order_id":       orderID,
-		"payment_id":     paymentID,
-		"redirect_url":   nil,
-		"payment_status": pay.Status,
-		"options":        opts.Options,
 	})
 }
 
@@ -261,11 +222,6 @@ func (h *Handlers) Resolve(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"order_id": orderID, "payment": pay})
 }
 
-type refundRequest struct {
-	AmountMinor int64  `json:"amount_minor"`
-	Reason      string `json:"reason"`
-}
-
 func (h *Handlers) Refund(w http.ResponseWriter, r *http.Request) {
 	owner, err := ownerID(r)
 	if err != nil {
@@ -277,7 +233,10 @@ func (h *Handlers) Refund(w http.ResponseWriter, r *http.Request) {
 		respond(w, 400, map[string]string{"error": "invalid order id"})
 		return
 	}
-	var in refundRequest
+	var in struct {
+		AmountMinor int64  `json:"amount_minor"`
+		Reason      string `json:"reason"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.AmountMinor <= 0 {
 		respond(w, 400, map[string]string{"error": "amount_minor required"})
 		return

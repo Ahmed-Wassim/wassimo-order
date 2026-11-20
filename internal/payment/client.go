@@ -12,23 +12,18 @@ import (
 	"time"
 )
 
-var (
-	ErrUnavailable   = errors.New("payment service unavailable")
-	ErrUnauthorized  = errors.New("payment service unauthorized")
-	ErrUpstream      = errors.New("payment service error")
-)
+var ErrUnavailable = errors.New("payment service unavailable")
 
-type UpstreamError struct {
+type StatusError struct {
 	Status int
 	Code   string
-	Body   string
 }
 
-func (e *UpstreamError) Error() string {
+func (e *StatusError) Error() string {
 	if e.Code != "" {
-		return fmt.Sprintf("payment upstream %d: %s", e.Status, e.Code)
+		return fmt.Sprintf("payment %d: %s", e.Status, e.Code)
 	}
-	return fmt.Sprintf("payment upstream %d", e.Status)
+	return fmt.Sprintf("payment %d", e.Status)
 }
 
 type Client struct {
@@ -196,26 +191,21 @@ func (c *Client) do(ctx context.Context, method, path, idemKey string, body any,
 
 	res, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return ErrUnavailable
 	}
 	defer res.Body.Close()
 	data, _ := io.ReadAll(res.Body)
 
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
-		if out == nil || len(data) == 0 {
-			return nil
-		}
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("%w: decode: %v", ErrUpstream, err)
+		if out != nil && len(data) > 0 {
+			if err := json.Unmarshal(data, out); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
-
-	if res.StatusCode == http.StatusUnauthorized || res.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("%w: status %d", ErrUnauthorized, res.StatusCode)
-	}
 	if res.StatusCode >= 500 {
-		return fmt.Errorf("%w: status %d", ErrUnavailable, res.StatusCode)
+		return ErrUnavailable
 	}
 
 	code := ""
@@ -230,5 +220,5 @@ func (c *Client) do(ctx context.Context, method, path, idemKey string, body any,
 			code = errBody.Error
 		}
 	}
-	return &UpstreamError{Status: res.StatusCode, Code: code, Body: string(data)}
+	return &StatusError{Status: res.StatusCode, Code: code}
 }
