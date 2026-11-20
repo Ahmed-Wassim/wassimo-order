@@ -424,6 +424,33 @@ func (s *Store) SetPaymentID(ctx context.Context, userID, orderID int64, payment
 	return nil
 }
 
+func (s *Store) ReplacePaymentID(ctx context.Context, userID, orderID int64, oldPaymentID, newPaymentID string) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE orders SET payment_id = $1, updated_at = NOW()
+		 WHERE id = $2 AND user_id = $3 AND payment_id = $4::uuid`,
+		newPaymentID, orderID, userID, oldPaymentID)
+	if err != nil {
+		return ErrStoreDown
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var existing *string
+	err = s.pool.QueryRow(ctx,
+		`SELECT payment_id::text FROM orders WHERE id = $1 AND user_id = $2`,
+		orderID, userID).Scan(&existing)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrNoOrder
+	}
+	if err != nil {
+		return ErrStoreDown
+	}
+	if existing != nil && *existing == newPaymentID {
+		return nil
+	}
+	return ErrPaymentPointerConflict
+}
+
 func parseOrderReference(reference string) (int64, error) {
 	const prefix = "order:"
 	if !strings.HasPrefix(reference, prefix) {

@@ -15,6 +15,7 @@ import (
 type Orders interface {
 	Get(ctx context.Context, userID, orderID int64) (*order.Order, error)
 	SetPaymentID(ctx context.Context, userID, orderID int64, paymentID string) error
+	ReplacePaymentID(ctx context.Context, userID, orderID int64, oldPaymentID, newPaymentID string) error
 }
 
 type Handlers struct {
@@ -118,19 +119,24 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
+	retryFrom := ""
 	if o.PaymentID != nil && *o.PaymentID != "" {
 		pay, err := h.client.GetPayment(r.Context(), *o.PaymentID)
 		if err != nil {
 			h.fail(w, err)
 			return
 		}
-		respond(w, 200, map[string]any{
-			"order_id":       orderID,
-			"payment_id":     *o.PaymentID,
-			"redirect_url":   nil,
-			"payment_status": pay.Status,
-		})
-		return
+		if (pay.Status == "failed" || pay.Status == "expired") && o.Status == "pending" {
+			retryFrom = *o.PaymentID
+		} else {
+			respond(w, 200, map[string]any{
+				"order_id":       orderID,
+				"payment_id":     *o.PaymentID,
+				"redirect_url":   nil,
+				"payment_status": pay.Status,
+			})
+			return
+		}
 	}
 	if o.Status != "pending" {
 		respond(w, 409, map[string]string{"error": "order cannot be paid"})
@@ -138,8 +144,14 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	amount, currency := payableAmountCurrency(o)
-	created, err := h.client.CreatePayment(r.Context(), fmt.Sprintf("order-pay-%d", orderID), CreatePaymentRequest{
-		Reference:         fmt.Sprintf("order:%d", orderID),
+	idemKey := fmt.Sprintf("order-pay-%d", orderID)
+	reference := fmt.Sprintf("order:%d", orderID)
+	if retryFrom != "" {
+		idemKey = fmt.Sprintf("order-pay-%d-retry-%s", orderID, retryFrom)
+		reference = fmt.Sprintf("order:%d:retry:%s", orderID, retryFrom)
+	}
+	created, err := h.client.CreatePayment(r.Context(), idemKey, CreatePaymentRequest{
+		Reference:         reference,
 		AmountMinor:       amount,
 		Currency:          currency,
 		ProviderAccountID: in.ProviderAccountID,
@@ -150,9 +162,16 @@ func (h *Handlers) Pay(w http.ResponseWriter, r *http.Request) {
 		h.fail(w, err)
 		return
 	}
-	if err := h.orders.SetPaymentID(r.Context(), owner, orderID, created.ID); err != nil {
-		h.fail(w, err)
-		return
+	if retryFrom != "" {
+		if err := h.orders.ReplacePaymentID(r.Context(), owner, orderID, retryFrom, created.ID); err != nil {
+			h.fail(w, err)
+			return
+		}
+	} else {
+		if err := h.orders.SetPaymentID(r.Context(), owner, orderID, created.ID); err != nil {
+			h.fail(w, err)
+			return
+		}
 	}
 	charge, err := h.client.Charge(r.Context(), created.ID)
 	if err != nil {
